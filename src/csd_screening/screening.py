@@ -1,4 +1,3 @@
-import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -9,28 +8,21 @@ from ccdc.search import Search
 from tqdm import tqdm
 
 """
-prescreening_molecules()
-Screening step 1
-- Elements up to H-Kr (suitable for 6-31G)
+screen_single_molecule_crystals()
+Screening for single-molecule crystals:
+- Only crystals containing a single unique molecule (len(set(SMILES)) == 1)
 - Has 3D coordinates
 - No errors
-- Excludes ionic compounds
-- Excludes structures determined by powder X-ray diffraction
-- Excludes polymers
-- Excludes radicals
-
-filter_and_reassign_molcodes()
-Screening step 2
-- If SMILES are duplicated, prioritize the one with the smallest R value.
+- Not from powder X-ray diffraction
+- Not polymeric
+- Records REFCODE and unit cell parameters (a, b, c, α, β, γ)
 """
 
 # Define the base directory for data/substituent at the project root
 BASE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "substituent"
 
 
-def record_csd_version(
-    md_file_path: str = "screening_info.md", elapsed_time: float = None
-):
+def record_csd_version(md_file_path: str = "screening_info.md", elapsed_time: float = None):
     """
     Records the current date, CSD version, and execution time in a Markdown file.
 
@@ -55,42 +47,41 @@ def record_csd_version(
         md_file.write(content)
 
 
-def prescreening_molecules():
+def screen_single_molecule_crystals():
     """
-    Screens molecules from a chemical database and saves MOL files and basic information.
+    Screens for single-molecule crystals from the CSD and records unit cell parameters.
 
-    The following criteria are used for screening:
-    - Elements up to H-Kr (suitable for 6-31G)
+    Screening criteria:
+    - Only crystals with a single unique molecule (len(set(SMILES)) == 1)
     - Has 3D coordinates
     - No errors
-    - Excludes ionic compounds
-    - Excludes structures determined by powder X-ray diffraction
-    - Excludes polymers
-    - Excludes radicals
+    - Not from powder X-ray diffraction
+    - Not polymeric
+
+    Output: parquet file with SMILES, InChI, unit cell parameters (a,b,c,α,β,γ), and REFCODE
     """
     record_csd_version()
+
+    # Set up screening conditions
     setting = Search.Settings()
     setting.has_3d_coordinates = True
     setting.no_errors = True
-    setting.no_ions = True
     setting.no_powder = True
     setting.not_polymeric = True
-    setting.no_metals = True
-    setting.only_organic = True
-    # setting.only_organometallic = False
 
-    mol_data = []
-    all_smiles = []
-    r_factors = []
+    crystal_data = []
+
     with io.EntryReader("CSD") as reader:
-        for entry in tqdm(reader):
+        for entry in tqdm(reader, desc="Screening CSD entries"):
             try:
-                # Skip entries that do not meet the settings criteria
+                # Skip entries that do not meet the basic settings criteria
                 if not setting.test(entry):
                     continue
 
-                r_factor = entry.r_factor
-                disorder = entry.has_disorder
+                # Get all molecule components and their SMILES
+                smiles_list = []
+                molecules = []
+
                 for mol in entry.molecule.components:
                     # Complete missing bonds and hydrogens
                     mol.assign_bond_types(which="unknown")
@@ -101,162 +92,64 @@ def prescreening_molecules():
                     if smiles is None:
                         continue
 
-                    # Skip if any atom is Kr (atomic number >= 36) or heavier
-                    if any(atom.atomic_number >= 36 for atom in mol.atoms):
-                        continue
+                    smiles_list.append(smiles)
+                    molecules.append(mol)
 
-                    # Skip if contains radicals (odd number of electrons)
-                    electrons = sum([a.atomic_number for a in mol.atoms])
-                    if electrons % 2 == 1:
-                        continue
+                # Check if this is a single-molecule crystal
+                unique_smiles = set(smiles_list)
+                if len(unique_smiles) != 1:
+                    continue  # Skip multi-molecule crystals
 
-                    # Generate InChI
-                    try:
-                        inchi = mol.generate_inchi().inchi
-                    except Exception:
-                        inchi = None
+                # Get the single unique molecule
+                representative_mol = molecules[0]
+                unique_smiles_str = list(unique_smiles)[0]
 
-                    try:
-                        molcode = all_smiles.index(smiles)
-                        new = False
-                    except ValueError:
-                        molcode = len(all_smiles)
-                        new = True
+                # Generate InChI
+                try:
+                    inchi = representative_mol.generate_inchi().inchi
+                except Exception:
+                    inchi = None
 
-                    # Save MOL file
-                    if (
-                        new
-                        or r_factors[molcode] is None
-                        or (r_factor is not None and r_factor < r_factors[molcode])
-                    ):
-                        mol_path = (
-                            BASE_DIR
-                            / "prescreening"
-                            / f"{molcode:06d}_prescreening.mol"
-                        )
-                        mol_path.parent.mkdir(parents=True, exist_ok=True)
-                        with mol_path.open("w") as mol_file:
-                            mol_file.write(mol.to_string(format="mol"))
+                # Get unit cell parameters
+                crystal = entry.crystal
+                if crystal is None:
+                    continue
 
-                        if new:
-                            all_smiles.append(smiles)
-                            r_factors.append(r_factor)
-                        else:
-                            r_factors[molcode] = r_factor
+                cell_lengths = crystal.cell_lengths  # (a, b, c)
+                cell_angles = crystal.cell_angles  # (α, β, γ)
 
-                        # Save data
-                        molcode = f"{molcode:06d}"
-                        mol_data.append(
-                            (
-                                molcode,
-                                smiles,
-                                inchi,
-                                entry.identifier,
-                                entry.chemical_name,
-                                mol.formula,
-                                mol.molecular_weight,
-                                mol.molecular_volume,
-                                electrons,
-                                r_factor,
-                                disorder,
-                            )
-                        )
+                # Record the data
+                crystal_data.append({
+                    "SMILES": unique_smiles_str,
+                    "InChI": inchi,
+                    "a": cell_lengths.a,
+                    "b": cell_lengths.b,
+                    "c": cell_lengths.c,
+                    "alpha": cell_angles.alpha,
+                    "beta": cell_angles.beta,
+                    "gamma": cell_angles.gamma,
+                    "refcode": entry.identifier,
+                })
 
             except Exception as e:
-                print(f"Error: {entry.identifier}")
-                print(e)
+                print(f"Error processing {entry.identifier}: {e}")
                 continue
 
-    df = pd.DataFrame(
-        mol_data,
-        columns=[
-            "molcode",
-            "SMILES",
-            "InChI",
-            "refcode",
-            "entry_name",
-            "formula",
-            "weight",
-            "volume",
-            "electrons",
-            "r_factor",
-            "disorder",
-        ],
-    )
-    (BASE_DIR).mkdir(parents=True, exist_ok=True)
-    df.to_csv(BASE_DIR / "screening_step1.csv")
+    # Create DataFrame
+    df = pd.DataFrame(crystal_data)
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Save as Parquet
+    parquet_file = BASE_DIR / "screening_refcode.parquet"
+    df.to_parquet(parquet_file, index=False)
 
-def filter_and_update_molcodes(csv_file: str, output_csv: str):
-    """
-    From the screened molecule data, select the molecule with the smallest R value among those with duplicate SMILES,
-    update the molcode, and save.
+    print(f"Screening complete. Found {len(df)} single-molecule crystals.")
 
-    Parameters
-    ----------
-    csv_file : str
-        Path to the input CSV file.
-    output_csv : str
-        Path to the output CSV file.
-    """
-    df = pd.read_csv(csv_file)
-    df["molcode"] = df["molcode"].astype(str)
-    df["r_factor"] = df["r_factor"].fillna(1e10)
-    filtered_df = df.loc[df.groupby("SMILES")["r_factor"].idxmin()]
-    filtered_df = filtered_df.reset_index(drop=True)
-
-    (BASE_DIR / "mol_original").mkdir(parents=True, exist_ok=True)
-
-    # Extract only rows for which the corresponding MOL file exists
-    exists_mask = filtered_df["molcode"].apply(
-        lambda mc: (BASE_DIR / "prescreening" / f"{mc}_prescreening.mol").exists()
-    )
-    missing_count = (~exists_mask).sum()
-    filtered_df = filtered_df[exists_mask].reset_index(drop=True)
-
-    # Reassign new molcodes and copy MOL files
-    for idx, row in filtered_df.iterrows():
-        new_molcode = f"{idx:06d}"
-        old_mol_path = BASE_DIR / "prescreening" / f"{row['molcode']}_prescreening.mol"
-        new_mol_path = BASE_DIR / "mol_original" / f"{new_molcode}_original.mol"
-        shutil.copy(old_mol_path, new_mol_path)
-        filtered_df.at[idx, "molcode"] = new_molcode
-
-    if missing_count > 0:
-        print(f"Total skipped rows due to missing MOL files: {missing_count}")
-
-    filtered_df.to_csv(output_csv, index=False)
-
-
-def archive_del_dir(directory_path: str):
-    """
-    Archives the specified directory as a ZIP file and then deletes the directory.
-
-    Parameters
-    ----------
-    directory_path : str
-        Path to the directory to archive.
-    """
-    directory = Path(directory_path)
-
-    # Do nothing if the directory does not exist
-    if not directory.is_dir():
-        print(f"Directory does not exist: {directory_path}")
-        return
-
-    # Archive the directory as a ZIP file
-    shutil.make_archive(directory_path, "zip", directory.parent, directory.name)
-
-    # Delete the original directory
-    shutil.rmtree(directory)
+    return df
 
 
 if __name__ == "__main__":
     start_time = time.time()
-    prescreening_molecules()
-    filter_and_update_molcodes(
-        str(BASE_DIR / "screening_step1.csv"), str(BASE_DIR / "screening_step2.csv")
-    )
-    archive_del_dir(str(BASE_DIR / "prescreening"))
+    screen_single_molecule_crystals()
     elapsed_time = time.time() - start_time
     record_csd_version(elapsed_time=elapsed_time)

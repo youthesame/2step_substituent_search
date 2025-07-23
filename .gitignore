@@ -9,5 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
+# ruff
+.ruff_cache
+
 # raw files
 data/substituent/
