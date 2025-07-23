@@ -6,11 +6,57 @@ from ccdc.molecule import Atom, Bond
 from tqdm import tqdm
 
 
+def is_alkyl_chain_bond(bond, mol):
+    """
+    結合がアルキル鎖の一部かどうかを判定する
+
+    Parameters
+    ----------
+    bond : Bond
+        判定する結合
+    mol : Molecule
+        分子オブジェクト
+
+    Returns
+    -------
+    bool
+        アルキル鎖の一部の場合はTrue
+    """
+    a0, a1 = bond.atoms
+
+    # C-C結合でない場合はFalse
+    if a0.atomic_number != 6 or a1.atomic_number != 6:
+        return False
+
+    # 両方の炭素が4つの結合を持つ場合（sp3炭素）
+    if len(a0.bonds) == 4 and len(a1.bonds) == 4:
+        # 水素原子の数を数える
+        h_count_a0 = sum(
+            1 for neighbour in a0.neighbours if neighbour.atomic_number == 1
+        )
+        h_count_a1 = sum(
+            1 for neighbour in a1.neighbours if neighbour.atomic_number == 1
+        )
+
+        # 両方の炭素が2つ以上の水素を持つ場合（-CH2-CH2-）
+        if h_count_a0 >= 2 and h_count_a1 >= 2:
+            return True
+
+        # 一方の炭素が3つの水素を持つ場合（CH3-CH2-）
+        if (h_count_a0 == 3 and h_count_a1 >= 2) or (
+            h_count_a1 == 3 and h_count_a0 >= 2
+        ):
+            return True
+
+    return False
+
+
 def fragment_molecule(
     molfile: str, max_ring: int = 8, exclude_alkyl_chains: bool = True
 ) -> list:
     """
     指定された分子ファイルから分子を読み込み、特定の条件に基づいて分子をフラグメント化する。
+    アルキル鎖除外ロジックを修正した版。
 
     Parameters
     ----------
@@ -81,33 +127,18 @@ def fragment_molecule(
             removed_bonds.add(b)
 
         # -CH2-CH2- は除外する。
-        elif n0 == 6 and n1 == 6:
-            if len(a0.bonds) == 4 and len(a1.bonds) == 4:
-                h_count = 0
-                for neighbour in a0.neighbours:
-                    if neighbour.atomic_number == 1:
-                        h_count += 1
-                if h_count == 2:
-                    removed_bonds.add(b)
-                    continue
-                h_count = 0
-                for neighbour in a1.neighbours:
-                    if neighbour.atomic_number == 1:
-                        h_count += 1
-                if h_count == 2:
-                    removed_bonds.add(b)
-                    continue
+        # elif n0 == 6 and n1 == 6:
+        #     if len(a0.bonds) == 4 and len(a1.bonds) == 4:
+        #         # 両方の炭素が2つの水素原子を持つ場合のみ除外
+        #         h_count_a0 = sum(1 for neighbour in a0.neighbours if neighbour.atomic_number == 1)
+        #         h_count_a1 = sum(1 for neighbour in a1.neighbours if neighbour.atomic_number == 1)
+        #         if h_count_a0 == 2 and h_count_a1 == 2:
+        #             removed_bonds.add(b)
+        #             continue
 
-        elif exclude_alkyl_chains:
-            # -CH3, -CH2-, -CH< は除外する。
-            if n0 == 6 and n1 == 1:
-                if len(a0.bonds) == 4:
-                    removed_bonds.add(b)
-                    continue
-            elif n0 == 1 and n1 == 6:
-                if len(a1.bonds) == 4:
-                    removed_bonds.add(b)
-                    continue
+        # アルキル鎖の除外
+        elif exclude_alkyl_chains and is_alkyl_chain_bond(b, mol):
+            removed_bonds.add(b)
 
     weak_bonds = weak_bonds - removed_bonds
     # print(weak_bonds)
@@ -274,10 +305,46 @@ def include_nitoro(mol: io.Molecule) -> bool:
         return False
 
 
+def test_fragmentation():
+    molfile = "../../data/test/fragmentation/POLFAB.mol"
+    fragments = fragment_molecule(molfile, exclude_alkyl_chains=True)
+    # 出力ディレクトリの作成
+    output_at_dir = Path("../../data/test/fragment_mol_at")
+    output_h_dir = Path("../../data/test/fragment_mol_h")
+    output_at_dir.mkdir(parents=True, exist_ok=True)
+    output_h_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_at_smiles = {}
+    existing_h_smiles = {}
+    f_count = 0
+    h_count = 0
+
+    for fragment in fragments:
+        at_smiles, h_smiles = generate_smiles(fragment)
+        if at_smiles not in existing_at_smiles:
+            existing_at_smiles[at_smiles] = f_count
+            f_count += 1
+            at_output_path = output_at_dir / f"{f_count}_fragment.mol"
+            with io.MoleculeWriter(str(at_output_path)) as f:
+                f.write(fragment)
+        if h_smiles not in existing_h_smiles:
+            existing_h_smiles[h_smiles] = h_count
+            h_count += 1
+            h_output_path = output_h_dir / f"{h_count}_h_fragment.mol"
+            with io.MoleculeWriter(str(h_output_path)) as f:
+                f.write(fragment)
+
+
 def main():
-    Path("fragment_mol_at").mkdir(exist_ok=True)
-    Path("fragment_mol_h").mkdir(exist_ok=True)
-    molfiles = sorted(Path("../240123_screening/mol_original").glob("*_original.mol"))
+    # 出力ディレクトリの作成
+    output_at_dir = Path("../../data/substituent/fragment_mol_at")
+    output_h_dir = Path("../../data/substituent/fragment_mol_h")
+    output_at_dir.mkdir(parents=True, exist_ok=True)
+    output_h_dir.mkdir(parents=True, exist_ok=True)
+
+    molfiles = sorted(
+        Path("../../data/substituent/mol_original").glob("*_original.mol")
+    )
     fragments_data = []
     existing_at_smiles = {}
     existing_h_smiles = {}
@@ -304,9 +371,8 @@ def main():
                             f_count += 1
 
                             # At 付き分子を保存
-                            with io.MoleculeWriter(
-                                f"fragment_mol_at/{f_code}_fragment.mol"
-                            ) as f:
+                            at_output_path = output_at_dir / f"{f_code}_fragment.mol"
+                            with io.MoleculeWriter(str(at_output_path)) as f:
                                 f.write(fragment)
 
                             # At を H に置き換えた分子を保存、重複の場合は保存しない
@@ -316,9 +382,10 @@ def main():
                                 h_code = f"{h_count:06d}"
                                 existing_h_smiles[h_smiles] = h_code
                                 h_count += 1
-                                with io.MoleculeWriter(
-                                    f"fragment_mol_h/{h_code}_h_fragment.mol"
-                                ) as f:
+                                h_output_path = (
+                                    output_h_dir / f"{h_code}_h_fragment.mol"
+                                )
+                                with io.MoleculeWriter(str(h_output_path)) as f:
                                     f.write(h_fragment)
 
                             else:
@@ -353,13 +420,15 @@ def main():
         ],
     )
     df["n_At"] = df["At_SMILES"].str.count("At")
-    df.to_csv("fragments_data.csv", index=False)
+    df.to_csv("../../data/substituent/fragments_data.csv", index=False)
 
 
 # TODO: H_SMILESが重複している分子を取り出して、１つの分子に At を集約する？
+# At の個数などを気にする必要あり。
 
 if __name__ == "__main__":
     main()
+    # test_fragmentation()
     # fragment_codeとh_codeはstr型に変換して"fragments_data.csv"読み込む
-    df = pd.read_csv("fragments_data.csv", dtype={"fragment_code": str, "h_code": str})
-    print(df)
+    # df = pd.read_csv("fragments_data.csv", dtype={"fragment_code": str, "h_code": str})
+    # print(df)

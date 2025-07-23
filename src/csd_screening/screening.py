@@ -1,4 +1,5 @@
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -9,51 +10,63 @@ from tqdm import tqdm
 
 """
 prescreening_molecules()
-スクリーニング step1
-- 元素は6-31Gを適用可能なH-Krまで
-- 3D座標を持つ
-- errorのない
-- イオン性のものは除く
-- 粉末X線回折で構造解析されているものは除く
-- 高分子は除く
-- ラジカルを含まない
+Screening step 1
+- Elements up to H-Kr (suitable for 6-31G)
+- Has 3D coordinates
+- No errors
+- Excludes ionic compounds
+- Excludes structures determined by powder X-ray diffraction
+- Excludes polymers
+- Excludes radicals
 
 filter_and_reassign_molcodes()
-スクリーニング step2
-- SMILES 重複したら、R値が小さいものを優先する。
+Screening step 2
+- If SMILES are duplicated, prioritize the one with the smallest R value.
 """
 
+# Define the base directory for data/substituent at the project root
+BASE_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "substituent"
 
-def record_csd_version(md_file_path: str = "screening_info.md"):
+
+def record_csd_version(
+    md_file_path: str = "screening_info.md", elapsed_time: float = None
+):
     """
-    現在の日付とCSDのバージョンをMarkdownファイルに記録します。
+    Records the current date, CSD version, and execution time in a Markdown file.
 
     Parameters
     ----------
     md_file_path : str
-        情報を記録するMarkdownファイルのパス。
+        Path to the Markdown file to record information.
+    elapsed_time : float, optional
+        Execution time in seconds.
     """
     current_date = datetime.now().strftime("%Y-%m-%d")
     csd_version = CSD_VERSION_LATEST
 
     content = f"# Screening Information\n\n- Execution Date: {current_date}\n- CSD version used: {csd_version}\n"
+    if elapsed_time is not None:
+        hours = int(elapsed_time // 3600)
+        minutes = int((elapsed_time % 3600) // 60)
+        seconds = int(elapsed_time % 60)
+        content += f"- Execution Time: {hours}h {minutes}m {seconds}s\n"
 
-    with Path(md_file_path).open("w", encoding="utf-8") as md_file:
+    with Path(md_file_path).open("w", encoding="utf-8", newline="\n") as md_file:
         md_file.write(content)
 
 
 def prescreening_molecules():
     """
-    化学データベースから分子をスクリーニングし、MOLファイルと基本情報を保存します。
+    Screens molecules from a chemical database and saves MOL files and basic information.
 
-    以下の条件を満たす分子をスクリーニングします：
-    - 元素は6-31Gを適用可能なH-Krまで
-    - 3D座標を持つ
-    - エラーがない
-    - イオン性のものは除く
-    - 粉末X線回折で構造解析されているものは除く
-    - 高分子は除く
-    - ラジカルを含まない
+    The following criteria are used for screening:
+    - Elements up to H-Kr (suitable for 6-31G)
+    - Has 3D coordinates
+    - No errors
+    - Excludes ionic compounds
+    - Excludes structures determined by powder X-ray diffraction
+    - Excludes polymers
+    - Excludes radicals
     """
     record_csd_version()
     setting = Search.Settings()
@@ -62,9 +75,8 @@ def prescreening_molecules():
     setting.no_ions = True
     setting.no_powder = True
     setting.not_polymeric = True
-    # setting.no_disorder = True
-    # setting.no_metals = True
-    # setting.only_organic = True
+    setting.no_metals = True
+    setting.only_organic = True
     # setting.only_organometallic = False
 
     mol_data = []
@@ -73,30 +85,36 @@ def prescreening_molecules():
     with io.EntryReader("CSD") as reader:
         for entry in tqdm(reader):
             try:
-                # settingの条件を満たさないものはスキップ
+                # Skip entries that do not meet the settings criteria
                 if not setting.test(entry):
                     continue
 
                 r_factor = entry.r_factor
                 disorder = entry.has_disorder
                 for mol in entry.molecule.components:
-                    # 欠損の補完
+                    # Complete missing bonds and hydrogens
                     mol.assign_bond_types(which="unknown")
                     mol.add_hydrogens(mode="missing")
 
-                    # SMILESの取得、エラーならスキップ
+                    # Get SMILES; skip if error
                     smiles = mol.smiles
                     if smiles is None:
                         continue
 
-                    # kr(原子番号:36) 以降はスキップ
+                    # Skip if any atom is Kr (atomic number >= 36) or heavier
                     if any(atom.atomic_number >= 36 for atom in mol.atoms):
                         continue
 
-                    # ラジカルを含むものはスキップ
+                    # Skip if contains radicals (odd number of electrons)
                     electrons = sum([a.atomic_number for a in mol.atoms])
                     if electrons % 2 == 1:
                         continue
+
+                    # Generate InChI
+                    try:
+                        inchi = mol.generate_inchi().inchi
+                    except Exception:
+                        inchi = None
 
                     try:
                         molcode = all_smiles.index(smiles)
@@ -105,13 +123,17 @@ def prescreening_molecules():
                         molcode = len(all_smiles)
                         new = True
 
-                    # MOLファイルの保存
+                    # Save MOL file
                     if (
                         new
                         or r_factors[molcode] is None
                         or (r_factor is not None and r_factor < r_factors[molcode])
                     ):
-                        mol_path = Path(f"prescreening/{molcode:06d}_prescreening.mol")
+                        mol_path = (
+                            BASE_DIR
+                            / "prescreening"
+                            / f"{molcode:06d}_prescreening.mol"
+                        )
                         mol_path.parent.mkdir(parents=True, exist_ok=True)
                         with mol_path.open("w") as mol_file:
                             mol_file.write(mol.to_string(format="mol"))
@@ -122,12 +144,13 @@ def prescreening_molecules():
                         else:
                             r_factors[molcode] = r_factor
 
-                        # データの保存
+                        # Save data
                         molcode = f"{molcode:06d}"
                         mol_data.append(
                             (
                                 molcode,
                                 smiles,
+                                inchi,
                                 entry.identifier,
                                 entry.chemical_name,
                                 mol.formula,
@@ -144,12 +167,12 @@ def prescreening_molecules():
                 print(e)
                 continue
 
-    # parquetファイルに保存する
     df = pd.DataFrame(
         mol_data,
         columns=[
             "molcode",
             "SMILES",
+            "InChI",
             "refcode",
             "entry_name",
             "formula",
@@ -160,66 +183,80 @@ def prescreening_molecules():
             "disorder",
         ],
     )
-    df.to_parquet("screening_step1.parquet")
+    (BASE_DIR).mkdir(parents=True, exist_ok=True)
+    df.to_csv(BASE_DIR / "screening_step1.csv")
 
 
-def filter_and_update_molcodes(parquet_file: str, output_csv: str):
+def filter_and_update_molcodes(csv_file: str, output_csv: str):
     """
-    スクリーニングされた分子のデータから、SMILES表記が重複している分子の中でR値が最小のものを選択し、molcodeを更新して保存する。
+    From the screened molecule data, select the molecule with the smallest R value among those with duplicate SMILES,
+    update the molcode, and save.
 
     Parameters
     ----------
-    parquet_file : str
-        入力parquetファイルのパス
+    csv_file : str
+        Path to the input CSV file.
     output_csv : str
-        出力CSVファイルのパス
+        Path to the output CSV file.
     """
-    df = pd.read_parquet(parquet_file)
-
-    # r_factor列でNaN値を大きな数値に置き換える
-    df["r_factor"].fillna(1e10, inplace=True)
-
-    # SMILESが重複している分子の中でR値が最小のものを選択
+    df = pd.read_csv(csv_file)
+    df["molcode"] = df["molcode"].astype(str)
+    df["r_factor"] = df["r_factor"].fillna(1e10)
     filtered_df = df.loc[df.groupby("SMILES")["r_factor"].idxmin()]
+    filtered_df = filtered_df.reset_index(drop=True)
 
-    Path("mol_original").mkdir(parents=True, exist_ok=True)
-    # molcodeを更新
-    for idx, row in tqdm(enumerate(filtered_df.itertuples()), total=len(filtered_df)):
+    (BASE_DIR / "mol_original").mkdir(parents=True, exist_ok=True)
+
+    # Extract only rows for which the corresponding MOL file exists
+    exists_mask = filtered_df["molcode"].apply(
+        lambda mc: (BASE_DIR / "prescreening" / f"{mc}_prescreening.mol").exists()
+    )
+    missing_count = (~exists_mask).sum()
+    filtered_df = filtered_df[exists_mask].reset_index(drop=True)
+
+    # Reassign new molcodes and copy MOL files
+    for idx, row in filtered_df.iterrows():
         new_molcode = f"{idx:06d}"
-        old_mol_path = Path(f"prescreening/{row.molcode}_prescreening.mol")
-        new_mol_path = Path(f"mol_original/{new_molcode}_original.mol")
-        shutil.move(old_mol_path, new_mol_path)
+        old_mol_path = BASE_DIR / "prescreening" / f"{row['molcode']}_prescreening.mol"
+        new_mol_path = BASE_DIR / "mol_original" / f"{new_molcode}_original.mol"
+        shutil.copy(old_mol_path, new_mol_path)
+        filtered_df.at[idx, "molcode"] = new_molcode
 
-        filtered_df.at[row.Index, "molcode"] = new_molcode
+    if missing_count > 0:
+        print(f"Total skipped rows due to missing MOL files: {missing_count}")
 
-    # csvファイルに保存する
     filtered_df.to_csv(output_csv, index=False)
 
 
 def archive_del_dir(directory_path: str):
     """
-    指定されたディレクトリをZIPファイルにアーカイブし、その後ディレクトリを削除します。
+    Archives the specified directory as a ZIP file and then deletes the directory.
 
     Parameters
     ----------
     directory_path : str
-        アーカイブするディレクトリのパス。
+        Path to the directory to archive.
     """
     directory = Path(directory_path)
 
-    # ディレクトリが存在しない場合は何もしない
+    # Do nothing if the directory does not exist
     if not directory.is_dir():
-        print(f"ディレクトリが存在しません: {directory_path}")
+        print(f"Directory does not exist: {directory_path}")
         return
 
-    # ディレクトリをZIPファイルにアーカイブ
+    # Archive the directory as a ZIP file
     shutil.make_archive(directory_path, "zip", directory.parent, directory.name)
 
-    # 元のディレクトリを削除
+    # Delete the original directory
     shutil.rmtree(directory)
 
 
 if __name__ == "__main__":
+    start_time = time.time()
     prescreening_molecules()
-    filter_and_update_molcodes("screening_step1.parquet", "screening_step2.csv")
-    archive_del_dir("prescreening")
+    filter_and_update_molcodes(
+        str(BASE_DIR / "screening_step1.csv"), str(BASE_DIR / "screening_step2.csv")
+    )
+    archive_del_dir(str(BASE_DIR / "prescreening"))
+    elapsed_time = time.time() - start_time
+    record_csd_version(elapsed_time=elapsed_time)
